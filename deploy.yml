@@ -1,0 +1,185 @@
+name: CI/CD Backend - Innovatech Chile
+
+# ──────────────────────────────────────────────────────────────
+# Trigger: solo cuando se hace push a la rama "deploy"
+# ──────────────────────────────────────────────────────────────
+on:
+  push:
+    branches:
+      - deploy
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: innovatech-backend
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+
+  # ────────────────────────────────────────
+  # JOB 1: Build y Push a ECR
+  # ────────────────────────────────────────
+  build-and-push:
+    name: Build y Push imagen a ECR
+    runs-on: ubuntu-latest
+
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
+      registry: ${{ steps.login-ecr.outputs.registry }}
+
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login a Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Construir imagen Docker (multi-stage)
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker build -t $IMAGE_URI .
+          echo "image=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+      - name: Push imagen a ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+                     $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "✅ Imagen publicada: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+  # ────────────────────────────────────────
+  # JOB 2: Deploy en EC2
+  # ────────────────────────────────────────
+  deploy:
+    name: Deploy en EC2 Backend
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login a ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Deploy en EC2 via SSH
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_URI: ${{ needs.build-and-push.outputs.image }}
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_BACKEND_SSH_KEY }}
+          EC2_HOST: ${{ secrets.EC2_BACKEND_HOST }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_ROOT_PASSWORD: ${{ secrets.DB_ROOT_PASSWORD }}
+        run: |
+          echo "$SSH_PRIVATE_KEY" > /tmp/ec2_key.pem
+          chmod 600 /tmp/ec2_key.pem
+
+          ssh -o StrictHostKeyChecking=no -i /tmp/ec2_key.pem ec2-user@$EC2_HOST << ENDSSH
+            set -e
+
+            echo "🔐 Login a ECR..."
+            aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+              docker login --username AWS --password-stdin $ECR_REGISTRY
+
+            echo "📥 Pull de la nueva imagen..."
+            docker pull $IMAGE_URI
+
+            echo "📁 Preparar directorio de trabajo..."
+            mkdir -p /home/ec2-user/backend
+
+            echo "📝 Escribir docker-compose.yml..."
+            cat > /home/ec2-user/backend/docker-compose.yml << 'COMPOSE'
+          version: "3.9"
+          services:
+            db:
+              image: mysql:8.0
+              container_name: innovatech-db
+              restart: unless-stopped
+              environment:
+                MYSQL_ROOT_PASSWORD: \${MYSQL_ROOT_PASSWORD}
+                MYSQL_DATABASE: \${DB_NAME:-innovatech}
+                MYSQL_USER: \${DB_USER:-admin}
+                MYSQL_PASSWORD: \${DB_PASSWORD}
+              volumes:
+                - db_data:/var/lib/mysql
+              networks:
+                - innovatech-net
+              healthcheck:
+                test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+                start_period: 30s
+            backend:
+              image: $IMAGE_URI
+              container_name: innovatech-backend
+              restart: unless-stopped
+              environment:
+                PORT: 3000
+                DB_HOST: db
+                DB_PORT: 3306
+                DB_USER: \${DB_USER:-admin}
+                DB_PASSWORD: \${DB_PASSWORD}
+                DB_NAME: \${DB_NAME:-innovatech}
+              ports:
+                - "3000:3000"
+              depends_on:
+                db:
+                  condition: service_healthy
+              networks:
+                - innovatech-net
+          volumes:
+            db_data:
+              driver: local
+          networks:
+            innovatech-net:
+              driver: bridge
+          COMPOSE
+
+            echo "📝 Escribir variables de entorno..."
+            cat > /home/ec2-user/backend/.env << ENVFILE
+          DB_PASSWORD=$DB_PASSWORD
+          MYSQL_ROOT_PASSWORD=$DB_ROOT_PASSWORD
+          DB_USER=admin
+          DB_NAME=innovatech
+          ENVFILE
+
+            echo "🛑 Detener stack anterior..."
+            cd /home/ec2-user/backend
+            docker compose down || true
+
+            echo "🚀 Levantar nuevo stack..."
+            docker compose up -d
+
+            echo "⏳ Esperando que el backend esté listo..."
+            sleep 20
+            curl -f http://localhost:3000/health && echo "✅ Deploy exitoso!" || echo "⚠️ Health check falló"
+
+            echo "🧹 Limpiar imágenes antiguas..."
+            docker image prune -f
+          ENDSSH
+
+          rm -f /tmp/ec2_key.pem
