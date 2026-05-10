@@ -10,7 +10,7 @@ WORKDIR /app
 COPY package*.json ./
 
 # Instalar solo dependencias de producción y limpiar cache
-RUN npm ci --only=production && npm cache clean --force
+RUN npm install --only=production && npm cache clean --force
 
 # ============================================================
 # STAGE 2: Runtime (imagen final mínima)
